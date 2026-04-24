@@ -56,6 +56,13 @@ func main() {
 	args := os.Args[1:]
 	sub, rest := peelSubcommand(args)
 
+	if sub == "" && containsAny(args, "--jsonl", "-jsonl") {
+		fmt.Fprintln(os.Stderr, "ctfuzz: --jsonl is a report/replay flag. Try:")
+		fmt.Fprintln(os.Stderr, "  ctfuzz report --jsonl <file>")
+		fmt.Fprintln(os.Stderr, "  ctfuzz replay --jsonl <file> --payload <file> --seq <n>")
+		os.Exit(exitError)
+	}
+
 	var (
 		hasFindings bool
 		err         error
@@ -94,6 +101,17 @@ func main() {
 // peelSubcommand detects a leading subcommand token. A bare word matching a
 // known subcommand consumes args[0]; anything else is treated as flags to
 // the default "scan" command.
+func containsAny(args []string, needles ...string) bool {
+	for _, a := range args {
+		for _, n := range needles {
+			if a == n || strings.HasPrefix(a, n+"=") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func peelSubcommand(args []string) (string, []string) {
 	if len(args) == 0 {
 		return "", args
