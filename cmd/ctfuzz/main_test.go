@@ -48,7 +48,7 @@ func TestHeaderClusteringSurfacesDeltaEndToEnd(t *testing.T) {
 		t.Fatalf("write payload: %v", err)
 	}
 
-	if err := run([]string{
+	if _, err := run([]string{
 		"--urls", urlsPath,
 		"--payload", payloadPath,
 		"--out", outPath,
@@ -152,7 +152,7 @@ func TestMethodsMatrixSplitsSummariesByMethod(t *testing.T) {
 	_ = os.WriteFile(urlsPath, []byte(server.URL+"/e\n"), 0600)
 	_ = os.WriteFile(payloadPath, []byte(`{"id":"1"}`), 0600)
 
-	if err := run([]string{
+	if _, err := run([]string{
 		"--urls", urlsPath,
 		"--payload", payloadPath,
 		"--out", outPath,
@@ -216,7 +216,7 @@ func TestMismatchAddsVariantsAndTagsBodyEncoding(t *testing.T) {
 	_ = os.WriteFile(urlsPath, []byte(server.URL+"/m\n"), 0600)
 	_ = os.WriteFile(payloadPath, []byte(`{"id":"1"}`), 0600)
 
-	if err := run([]string{
+	if _, err := run([]string{
 		"--urls", urlsPath,
 		"--payload", payloadPath,
 		"--out", outPath,
@@ -285,7 +285,7 @@ func TestScopeFileAbortsByDefault(t *testing.T) {
 		t.Fatalf("write payload: %v", err)
 	}
 
-	err := run([]string{
+	_, err := run([]string{
 		"--urls", urlsPath,
 		"--scope-file", scopePath,
 		"--payload", payloadPath,
@@ -312,7 +312,7 @@ func TestScopeFileContinuesWithAllowDrops(t *testing.T) {
 	_ = os.WriteFile(scopePath, []byte("in-scope.example.com\n"), 0600)
 	_ = os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600)
 
-	if err := run([]string{
+	if _, err := run([]string{
 		"--urls", urlsPath,
 		"--scope-file", scopePath,
 		"--allow-scope-drops",
@@ -338,7 +338,7 @@ func TestDryRunSkipsNetwork(t *testing.T) {
 	_ = os.WriteFile(urlsPath, []byte(server.URL+"/foo\n"), 0600)
 	_ = os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600)
 
-	if err := run([]string{
+	if _, err := run([]string{
 		"--urls", urlsPath,
 		"--payload", payloadPath,
 		"--out", outPath,
@@ -366,7 +366,7 @@ func TestMaxRequestsPerHostCapsVolume(t *testing.T) {
 	_ = os.WriteFile(urlsPath, []byte(server.URL+"/a\n"+server.URL+"/b\n"), 0600)
 	_ = os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600)
 
-	if err := run([]string{
+	if _, err := run([]string{
 		"--urls", urlsPath,
 		"--payload", payloadPath,
 		"--out", outPath,
@@ -511,7 +511,7 @@ func TestRunEndToEndAgainstDifferentialServer(t *testing.T) {
 		t.Fatalf("write payload: %v", err)
 	}
 
-	if err := run([]string{
+	if _, err := run([]string{
 		"--urls", urlsPath,
 		"--payload", payloadPath,
 		"--out", outPath,

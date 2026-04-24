@@ -38,36 +38,111 @@ type job struct {
 	body         []byte
 }
 
+// Exit codes are a stable contract for agent pipelines:
+//
+//	0  clean run, no interesting findings
+//	1  unexpected error (config, IO, network infrastructure)
+//	2  CLI usage error (reserved; flag pkg maps to 2 on its own)
+//	3  scope violation (URLs outside --scope-file; --allow-scope-drops bypasses)
+//	4  clean run, interesting findings present
+const (
+	exitOK           = 0
+	exitError        = 1
+	exitScope        = 3
+	exitFindings     = 4
+)
+
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	args := os.Args[1:]
+	sub, rest := peelSubcommand(args)
+
+	var (
+		hasFindings bool
+		err         error
+	)
+	switch sub {
+	case "scan", "":
+		hasFindings, err = run(rest)
+	case "replay":
+		err = runReplay(rest)
+	case "report":
+		err = runReport(rest)
+	case "help", "-h", "--help":
+		printTopHelp()
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "ctfuzz: unknown subcommand %q (try: scan, replay, report)\n", sub)
+		os.Exit(exitError)
+	}
+
+	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			os.Exit(0)
+			os.Exit(exitOK)
 		}
 		if errors.Is(err, errScopeViolation) {
 			fmt.Fprintf(os.Stderr, "ctfuzz: %v\n", err)
-			os.Exit(3)
+			os.Exit(exitScope)
 		}
 		fmt.Fprintf(os.Stderr, "ctfuzz: %v\n", err)
-		os.Exit(1)
+		os.Exit(exitError)
+	}
+	if hasFindings {
+		os.Exit(exitFindings)
 	}
 }
 
-func run(args []string) error {
+// peelSubcommand detects a leading subcommand token. A bare word matching a
+// known subcommand consumes args[0]; anything else is treated as flags to
+// the default "scan" command.
+func peelSubcommand(args []string) (string, []string) {
+	if len(args) == 0 {
+		return "", args
+	}
+	first := args[0]
+	if strings.HasPrefix(first, "-") {
+		return "", args
+	}
+	switch first {
+	case "scan", "replay", "report", "help":
+		return first, args[1:]
+	}
+	return "", args
+}
+
+func printTopHelp() {
+	fmt.Fprint(os.Stderr, `ctfuzz — content-type differential fuzzer
+
+usage:
+  ctfuzz [scan] [flags]         run a scan (default)
+  ctfuzz replay  [flags]        print a reproducible curl for one request
+  ctfuzz report  [flags]        summarize a scan JSONL as markdown or json
+
+exit codes:
+  0  clean run, no findings
+  1  unexpected error
+  3  scope violation
+  4  clean run, interesting findings present
+
+Run 'ctfuzz scan -h', 'ctfuzz replay -h', or 'ctfuzz report -h' for per-subcommand flags.
+`)
+}
+
+func run(args []string) (bool, error) {
 	cfg, err := config.Parse(args, os.Stderr)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	urls, err := input.LoadURLs(cfg.URLsFile)
 	if err != nil {
-		return err
+		return false, err
 	}
 	fmt.Printf("[+] loaded %d urls\n", len(urls))
 
 	if cfg.ScopeFile != "" {
 		matcher, err := scope.Load(cfg.ScopeFile)
 		if err != nil {
-			return fmt.Errorf("scope file: %w", err)
+			return false, fmt.Errorf("scope file: %w", err)
 		}
 		kept, dropped := applyScope(matcher, urls)
 		if len(dropped) > 0 {
@@ -76,19 +151,19 @@ func run(args []string) error {
 				fmt.Fprintf(os.Stderr, "    %s\n", u)
 			}
 			if !cfg.AllowScopeDrops {
-				return errScopeViolation
+				return false, errScopeViolation
 			}
 		}
 		urls = kept
 		if len(urls) == 0 {
-			return errors.New("all URLs were dropped by scope filter")
+			return false, errors.New("all URLs were dropped by scope filter")
 		}
 		fmt.Printf("[+] %d urls within scope\n", len(urls))
 	}
 
 	headers, err := input.LoadHeaders(cfg.HeadersFile)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(headers) > 0 {
 		fmt.Printf("[+] loaded %d static headers\n", len(headers))
@@ -96,13 +171,13 @@ func run(args []string) error {
 
 	basePayload, err := payload.Load(cfg.PayloadFile, cfg.MaxRequestBody, cfg.Canary)
 	if err != nil {
-		return err
+		return false, err
 	}
 	fmt.Printf("[+] loaded payload with %d keys\n", len(basePayload))
 
 	variants, err := buildVariants(cfg, basePayload)
 	if err != nil {
-		return err
+		return false, err
 	}
 	fmt.Printf("[+] testing %d variants across %d method(s) per URL\n", len(variants), len(cfg.Methods))
 	if cfg.Insecure {
@@ -114,7 +189,7 @@ func run(args []string) error {
 
 	if cfg.DryRun {
 		fmt.Println("[+] dry run complete; no requests sent")
-		return nil
+		return false, nil
 	}
 
 	client, err := httpclient.New(httpclient.Config{
@@ -130,14 +205,18 @@ func run(args []string) error {
 		RequestsPerSecond: cfg.RequestsPerSecond,
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	results := execute(context.Background(), client, cfg, urls, headers, variants)
 	summaries := summarize(urls, cfg.Methods, results)
 	summaryByKey := make(map[string]result.Summary, len(summaries))
+	hasFindings := false
 	for _, summary := range summaries {
 		summaryByKey[summaryKey(summary.URL, summary.Method)] = summary
+		if summary.Interesting {
+			hasFindings = true
+		}
 	}
 	analyze.MarkInteresting(results, summaryByKey)
 
@@ -157,11 +236,20 @@ func run(args []string) error {
 		}
 	}
 
-	if err := output.WriteJSONL(cfg.OutputFile, results, summaries); err != nil {
-		return err
+	manifest := result.Manifest{
+		Kind:     "manifest",
+		Schema:   1,
+		Created:  time.Now().UTC().Format(time.RFC3339),
+		Canary:   cfg.Canary,
+		Methods:  cfg.Methods,
+		Types:    cfg.Types,
+		Mismatch: cfg.Mismatch,
+	}
+	if err := output.WriteJSONL(cfg.OutputFile, manifest, results, summaries); err != nil {
+		return false, err
 	}
 	fmt.Printf("[+] wrote results to %s\n", cfg.OutputFile)
-	return nil
+	return hasFindings, nil
 }
 
 type variant struct {

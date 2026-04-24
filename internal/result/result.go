@@ -1,7 +1,7 @@
 package result
 
 type Request struct {
-	Seq              int               `json:"-"`
+	Seq              int               `json:"seq"`
 	URL              string            `json:"url"`
 	Method           string            `json:"method"`
 	ContentType      string            `json:"content_type"`
@@ -20,6 +20,20 @@ type Request struct {
 	Error            string            `json:"error"`
 	Body             string            `json:"body,omitempty"`
 	ResponseHeaders  map[string]string `json:"response_headers,omitempty"`
+}
+
+// Manifest is the first line of every scan JSONL. It carries the metadata
+// needed to reproduce the run (canary, methods, variants) so downstream
+// tooling like `ctfuzz replay` and `ctfuzz report` don't need to rebuild
+// state from inference.
+type Manifest struct {
+	Kind     string   `json:"kind"`
+	Schema   int      `json:"schema"`
+	Created  string   `json:"created"`
+	Canary   string   `json:"canary,omitempty"`
+	Methods  []string `json:"methods"`
+	Types    []string `json:"types"`
+	Mismatch bool     `json:"mismatch,omitempty"`
 }
 
 type Summary struct {

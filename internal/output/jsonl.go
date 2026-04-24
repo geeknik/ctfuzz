@@ -10,7 +10,7 @@ import (
 	"ctfuzz/internal/result"
 )
 
-func WriteJSONL(path string, requests []result.Request, summaries []result.Summary) error {
+func WriteJSONL(path string, manifest result.Manifest, requests []result.Request, summaries []result.Summary) error {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
 	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
@@ -34,6 +34,10 @@ func WriteJSONL(path string, requests []result.Request, summaries []result.Summa
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 
+	if err := enc.Encode(manifest); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	for _, req := range requests {
 		if err := enc.Encode(req); err != nil {
 			_ = tmp.Close()
