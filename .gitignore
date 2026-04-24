@@ -1,0 +1,5 @@
+/ctfuzz
+*.jsonl
+/urls.txt
+/headers.txt
+/scope.txt

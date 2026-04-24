@@ -1,0 +1,42 @@
+{
+  "id": "1",
+  "user_id": "1001",
+  "account_id": "acct_1001",
+  "username": "ctfuzz_user",
+  "password": "ctfuzz_pass",
+  "email": "ctfuzz@example.com",
+  "role": "user",
+  "scope": "read",
+  "tenant": "public",
+  "admin": false,
+  "debug": false,
+  "active": true,
+  "enabled": true,
+  "token": "ctfuzz_token",
+  "session": "ctfuzz_session",
+  "csrf": "ctfuzz_csrf",
+  "search": "ctfuzz",
+  "query": "ctfuzz",
+  "page": 1,
+  "limit": 10,
+  "offset": 0,
+  "sort": "id",
+  "redirect": "/",
+  "callback": "ctfuzz_callback",
+  "format": "json",
+  "content_type": "application/json",
+  "metadata": {
+    "source": "ctfuzz",
+    "client": "ctfuzz",
+    "trace_id": "ctfuzz_trace"
+  },
+  "flags": {
+    "preview": false,
+    "dry_run": true
+  },
+  "profile": {
+    "name": "ctfuzz user",
+    "department": "security"
+  },
+  "nullable": null
+}
