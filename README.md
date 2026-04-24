@@ -241,10 +241,8 @@ covered by adversarial tests (`*_adversarial_test.go`).
 
 ## License
 
-See [LICENSE](./LICENSE) once added. Until then, treat this as "all
-rights reserved by the author." Drop in MIT/Apache-2.0/BSD-3-Clause as
-you prefer before publishing.
+See [LICENSE](./LICENSE).
 
 ## Author
 
-[geeknik](https://github.com/geeknik) — info@geeknik-labs.com
+[geeknik](https://github.com/geeknik)
