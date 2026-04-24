@@ -3,13 +3,16 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"ctfuzz/internal/config"
 	"ctfuzz/internal/payload"
 	"ctfuzz/internal/render"
 )
@@ -123,6 +126,172 @@ func readRawSummaries(t *testing.T, path string) []fullSummary {
 		t.Fatalf("scan: %v", err)
 	}
 	return out
+}
+
+func TestScopeFileAbortsByDefault(t *testing.T) {
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	scopePath := filepath.Join(dir, "scope.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+
+	body := "https://in-scope.example.com/a\nhttps://out-of-scope.attacker.test/x\n"
+	if err := os.WriteFile(urlsPath, []byte(body), 0600); err != nil {
+		t.Fatalf("write urls: %v", err)
+	}
+	if err := os.WriteFile(scopePath, []byte("in-scope.example.com\n"), 0600); err != nil {
+		t.Fatalf("write scope: %v", err)
+	}
+	if err := os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	err := run([]string{
+		"--urls", urlsPath,
+		"--scope-file", scopePath,
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--dry-run",
+	})
+	if err == nil {
+		t.Fatal("expected scope violation error")
+	}
+	if !errors.Is(err, errScopeViolation) {
+		t.Fatalf("expected errScopeViolation, got %v", err)
+	}
+}
+
+func TestScopeFileContinuesWithAllowDrops(t *testing.T) {
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	scopePath := filepath.Join(dir, "scope.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+
+	body := "https://in-scope.example.com/a\nhttps://out-of-scope.attacker.test/x\n"
+	_ = os.WriteFile(urlsPath, []byte(body), 0600)
+	_ = os.WriteFile(scopePath, []byte("in-scope.example.com\n"), 0600)
+	_ = os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600)
+
+	if err := run([]string{
+		"--urls", urlsPath,
+		"--scope-file", scopePath,
+		"--allow-scope-drops",
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--dry-run",
+	}); err != nil {
+		t.Fatalf("expected dry-run with scope drops to succeed: %v", err)
+	}
+}
+
+func TestDryRunSkipsNetwork(t *testing.T) {
+	// httptest server that fails the test if hit.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("network call during dry run to %s", r.URL.Path)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+	_ = os.WriteFile(urlsPath, []byte(server.URL+"/foo\n"), 0600)
+	_ = os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600)
+
+	if err := run([]string{
+		"--urls", urlsPath,
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--dry-run",
+	}); err != nil {
+		t.Fatalf("dry-run failed: %v", err)
+	}
+	if _, err := os.Stat(outPath); err == nil {
+		t.Fatal("dry-run should not write results file")
+	}
+}
+
+func TestMaxRequestsPerHostCapsVolume(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+	_ = os.WriteFile(urlsPath, []byte(server.URL+"/a\n"+server.URL+"/b\n"), 0600)
+	_ = os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600)
+
+	if err := run([]string{
+		"--urls", urlsPath,
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--types", "core",
+		"--max-requests-per-host", "4",
+		"--concurrency", "2",
+		"--timeout", "2s",
+		"--canary", "none",
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := attempts.Load(); got != 4 {
+		t.Fatalf("expected 4 requests under per-host cap, got %d", got)
+	}
+}
+
+func TestCanaryPrefixDefaultHasNoCtfuzzTell(t *testing.T) {
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+	_ = os.WriteFile(urlsPath, []byte("https://in-scope.example.com/a\n"), 0600)
+	_ = os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600)
+
+	// --dry-run so no network; we inspect canary via payload load path.
+	// Run parse alone to verify the resolved canary.
+	cfg, err := configParseFor([]string{
+		"--urls", urlsPath,
+		"--payload", payloadPath,
+		"--out", outPath,
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if strings.HasPrefix(cfg.Canary, "ctfuzz_") {
+		t.Fatalf("canary default should not leak the ctfuzz_ prefix: %q", cfg.Canary)
+	}
+	if len(cfg.Canary) < 16 {
+		t.Fatalf("default random canary should be ≥16 hex chars: %q", cfg.Canary)
+	}
+}
+
+func TestCanaryPrefixRespectsFlag(t *testing.T) {
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	_ = os.WriteFile(urlsPath, []byte("https://in-scope.example.com/a\n"), 0600)
+	_ = os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600)
+
+	cfg, err := configParseFor([]string{
+		"--urls", urlsPath,
+		"--payload", payloadPath,
+		"--canary-prefix", "markerx_",
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !strings.HasPrefix(cfg.Canary, "markerx_") {
+		t.Fatalf("expected prefix honored, got %q", cfg.Canary)
+	}
+}
+
+func configParseFor(args []string) (config.Config, error) {
+	return config.Parse(args, os.Stderr)
 }
 
 func TestShippedPayloadLoadsAndRenders(t *testing.T) {

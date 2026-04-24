@@ -24,26 +24,31 @@ const (
 )
 
 type Config struct {
-	URLsFile          string
-	PayloadFile       string
-	HeadersFile       string
-	OutputFile        string
-	Method            string
-	Concurrency       int
-	Timeout           time.Duration
-	Delay             time.Duration
-	Proxy             string
-	Insecure          bool
-	FollowRedirects   bool
-	MaxBodyRead       int64
-	MaxRequestBody    int64
-	IncludeBody       bool
-	Types             []string
-	Canary            string
-	Verbose           bool
-	Retries           int
-	RetryBackoff      time.Duration
-	RequestsPerSecond float64
+	URLsFile           string
+	PayloadFile        string
+	HeadersFile        string
+	OutputFile         string
+	ScopeFile          string
+	AllowScopeDrops    bool
+	DryRun             bool
+	MaxRequestsPerHost int
+	CanaryPrefix       string
+	Method             string
+	Concurrency        int
+	Timeout            time.Duration
+	Delay              time.Duration
+	Proxy              string
+	Insecure           bool
+	FollowRedirects    bool
+	MaxBodyRead        int64
+	MaxRequestBody     int64
+	IncludeBody        bool
+	Types              []string
+	Canary             string
+	Verbose            bool
+	Retries            int
+	RetryBackoff       time.Duration
+	RequestsPerSecond  float64
 }
 
 func Parse(args []string, output io.Writer) (Config, error) {
@@ -79,10 +84,15 @@ func Parse(args []string, output io.Writer) (Config, error) {
 	fs.BoolVar(&cfg.IncludeBody, "include-body", false, "write truncated response bodies to JSONL")
 	fs.StringVar(&rawTypes, "types", "all", "comma-separated content types: "+render.TypeHelp)
 	fs.StringVar(&cfg.Canary, "canary", "random", "canary value to inject; use random or none")
+	fs.StringVar(&cfg.CanaryPrefix, "canary-prefix", "", "optional fixed prefix prepended to the random canary (empty for an unfingerprintable token)")
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "print every request result")
 	fs.IntVar(&cfg.Retries, "retries", 0, "retries per request on network errors only")
 	fs.DurationVar(&cfg.RetryBackoff, "retry-backoff", 250*time.Millisecond, "base backoff between retries; exponential with jitter")
 	fs.Float64Var(&cfg.RequestsPerSecond, "rps", 0, "per-host requests-per-second cap; 0 disables rate limiting")
+	fs.StringVar(&cfg.ScopeFile, "scope-file", "", "file of allowlisted hosts (exact or *.wildcard); URLs outside scope are dropped and the run aborts unless --allow-scope-drops is set")
+	fs.BoolVar(&cfg.AllowScopeDrops, "allow-scope-drops", false, "continue with a warning when --scope-file filters URLs; default is to abort")
+	fs.BoolVar(&cfg.DryRun, "dry-run", false, "plan only: print the request matrix and exit without sending any requests")
+	fs.IntVar(&cfg.MaxRequestsPerHost, "max-requests-per-host", 0, "hard cap on total requests sent to any single host; 0 disables")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -141,6 +151,15 @@ func (c *Config) normalize() error {
 	if c.RequestsPerSecond < 0 || c.RequestsPerSecond > 1000 {
 		return errors.New("--rps must be between 0 and 1000")
 	}
+	if c.MaxRequestsPerHost < 0 || c.MaxRequestsPerHost > 1_000_000 {
+		return errors.New("--max-requests-per-host must be between 0 and 1000000")
+	}
+	if len(c.CanaryPrefix) > 64 {
+		return errors.New("--canary-prefix must be 64 bytes or fewer")
+	}
+	if strings.ContainsAny(c.CanaryPrefix, "\r\n\t\x00 ") {
+		return errors.New("--canary-prefix must not contain whitespace or control characters")
+	}
 	if c.Proxy != "" {
 		if err := validateProxy(c.Proxy); err != nil {
 			return err
@@ -152,7 +171,7 @@ func (c *Config) normalize() error {
 
 	switch c.Canary {
 	case "random":
-		canary, err := randomCanary()
+		canary, err := randomCanary(c.CanaryPrefix)
 		if err != nil {
 			return err
 		}
@@ -199,10 +218,10 @@ func validateProxy(raw string) error {
 	}
 }
 
-func randomCanary() (string, error) {
-	var b [4]byte
+func randomCanary(prefix string) (string, error) {
+	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", errors.New("failed to generate canary")
 	}
-	return "ctfuzz_" + hex.EncodeToString(b[:]), nil
+	return prefix + hex.EncodeToString(b[:]), nil
 }
