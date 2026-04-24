@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -84,11 +86,12 @@ func TestHeaderClusteringSurfacesDeltaEndToEnd(t *testing.T) {
 }
 
 type fullSummary struct {
-	URL          string               `json:"url"`
-	Kind         string               `json:"kind"`
-	Interesting  bool                 `json:"interesting"`
-	Score        int                  `json:"score"`
-	HeaderGroups []fullHeaderGroup    `json:"header_groups"`
+	URL          string            `json:"url"`
+	Method       string            `json:"method"`
+	Kind         string            `json:"kind"`
+	Interesting  bool              `json:"interesting"`
+	Score        int               `json:"score"`
+	HeaderGroups []fullHeaderGroup `json:"header_groups"`
 }
 
 type fullHeaderGroup struct {
@@ -126,6 +129,142 @@ func readRawSummaries(t *testing.T, path string) []fullSummary {
 		t.Fatalf("scan: %v", err)
 	}
 	return out
+}
+
+func TestMethodsMatrixSplitsSummariesByMethod(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "POST":
+			w.WriteHeader(http.StatusForbidden)
+		case "PUT":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("put-accepted"))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+	_ = os.WriteFile(urlsPath, []byte(server.URL+"/e\n"), 0600)
+	_ = os.WriteFile(payloadPath, []byte(`{"id":"1"}`), 0600)
+
+	if err := run([]string{
+		"--urls", urlsPath,
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--types", "core",
+		"--methods", "POST,PUT",
+		"--concurrency", "2",
+		"--timeout", "2s",
+		"--canary", "none",
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	summaries := readRawSummaries(t, outPath)
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 summaries (POST, PUT), got %d", len(summaries))
+	}
+	byMethod := map[string]fullSummary{}
+	for _, s := range summaries {
+		byMethod[s.Method] = s
+	}
+	if byMethod["POST"].Method != "POST" {
+		t.Fatalf("expected POST summary present, got %#v", summaries)
+	}
+	if byMethod["PUT"].Method != "PUT" {
+		t.Fatalf("expected PUT summary present, got %#v", summaries)
+	}
+	// PUT returned 200 uniformly, POST returned 403 uniformly; neither should be
+	// "interesting" on its own since it's not a differential within the method.
+	if byMethod["POST"].Interesting || byMethod["PUT"].Interesting {
+		t.Fatalf("expected uniform-status summaries to be uninteresting: %#v", summaries)
+	}
+}
+
+func TestMismatchAddsVariantsAndTagsBodyEncoding(t *testing.T) {
+	var seen struct {
+		mu         sync.Mutex
+		variants   map[string]int
+		bodies     map[string]string
+		noCTCount  int
+	}
+	seen.variants = map[string]int{}
+	seen.bodies = map[string]string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf, _ := io.ReadAll(r.Body)
+		seen.mu.Lock()
+		ct := r.Header.Get("Content-Type")
+		seen.variants[ct]++
+		seen.bodies[ct] = string(buf)
+		if ct == "" {
+			seen.noCTCount++
+		}
+		seen.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+	_ = os.WriteFile(urlsPath, []byte(server.URL+"/m\n"), 0600)
+	_ = os.WriteFile(payloadPath, []byte(`{"id":"1"}`), 0600)
+
+	if err := run([]string{
+		"--urls", urlsPath,
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--types", "core",
+		"--mismatch",
+		"--concurrency", "2",
+		"--timeout", "2s",
+		"--canary", "none",
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Read request lines (not summaries) and confirm BodyEncoding + VariantName
+	// were populated.
+	f, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	mismatchSeen := 0
+	noCTSeen := 0
+	for scanner.Scan() {
+		var raw map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if raw["kind"] == "summary" {
+			continue
+		}
+		variant, _ := raw["variant"].(string)
+		if strings.Contains(variant, "-as-") || strings.Contains(variant, "-no-header") {
+			mismatchSeen++
+		}
+		if variant == "json-no-header" || variant == "form-no-header" {
+			noCTSeen++
+		}
+	}
+	if mismatchSeen < len(render.MismatchScenarios) {
+		t.Fatalf("expected %d mismatch variants in output, got %d", len(render.MismatchScenarios), mismatchSeen)
+	}
+	if noCTSeen < 2 {
+		t.Fatalf("expected 2 no-header variants, got %d", noCTSeen)
+	}
+	if seen.noCTCount < 2 {
+		t.Fatalf("expected server to see 2 requests without Content-Type, saw %d", seen.noCTCount)
+	}
 }
 
 func TestScopeFileAbortsByDefault(t *testing.T) {

@@ -45,6 +45,7 @@ type RequestSpec struct {
 	URL         string
 	Method      string
 	ContentType string
+	OmitCT      bool
 	Body        []byte
 	Headers     http.Header
 }
@@ -157,7 +158,7 @@ func (c *Client) attempt(parent context.Context, spec RequestSpec) (result.Reque
 		res.Error = "request creation failed"
 		return res, false
 	}
-	applyHeaders(req, spec.Headers, spec.ContentType)
+	applyHeaders(req, spec.Headers, spec.ContentType, spec.OmitCT)
 
 	start := time.Now()
 	resp, err := c.httpClient.Do(req)
@@ -191,7 +192,7 @@ func (c *Client) attempt(parent context.Context, spec RequestSpec) (result.Reque
 	return res, false
 }
 
-func applyHeaders(req *http.Request, headers http.Header, contentType string) {
+func applyHeaders(req *http.Request, headers http.Header, contentType string, omitCT bool) {
 	for name, values := range headers {
 		for _, value := range values {
 			req.Header.Add(name, value)
@@ -203,7 +204,13 @@ func applyHeaders(req *http.Request, headers http.Header, contentType string) {
 	if req.Header.Get("Accept") == "" {
 		req.Header.Set("Accept", "*/*")
 	}
-	req.Header.Set("Content-Type", contentType)
+	if omitCT {
+		req.Header.Del("Content-Type")
+		return
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 }
 
 func readLimited(r io.Reader, maxBytes int64) ([]byte, bool, error) {

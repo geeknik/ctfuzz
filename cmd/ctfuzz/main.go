@@ -28,10 +28,14 @@ import (
 var errScopeViolation = errors.New("out-of-scope URLs detected; pass --allow-scope-drops to continue")
 
 type job struct {
-	seq         int
-	url         string
+	seq          int
+	url          string
+	method       string
+	variant      string
 	contentType string
-	body        []byte
+	omitCT       bool
+	bodyEncoding string
+	body         []byte
 }
 
 func main() {
@@ -96,18 +100,11 @@ func run(args []string) error {
 	}
 	fmt.Printf("[+] loaded payload with %d keys\n", len(basePayload))
 
-	bodies := map[string][]byte{}
-	for _, contentType := range cfg.Types {
-		body, err := render.Body(contentType, basePayload)
-		if err != nil {
-			return err
-		}
-		if int64(len(body)) > cfg.MaxRequestBody {
-			return fmt.Errorf("%s request body exceeds %d bytes", contentType, cfg.MaxRequestBody)
-		}
-		bodies[contentType] = body
+	variants, err := buildVariants(cfg, basePayload)
+	if err != nil {
+		return err
 	}
-	fmt.Printf("[+] testing %d content-types per URL\n", len(cfg.Types))
+	fmt.Printf("[+] testing %d variants across %d method(s) per URL\n", len(variants), len(cfg.Methods))
 	if cfg.Insecure {
 		fmt.Println("[!] TLS certificate verification disabled")
 	}
@@ -136,17 +133,23 @@ func run(args []string) error {
 		return err
 	}
 
-	results := execute(context.Background(), client, cfg, urls, headers, bodies)
-	summaries := summarize(urls, results)
-	summaryByURL := make(map[string]result.Summary, len(summaries))
+	results := execute(context.Background(), client, cfg, urls, headers, variants)
+	summaries := summarize(urls, cfg.Methods, results)
+	summaryByKey := make(map[string]result.Summary, len(summaries))
 	for _, summary := range summaries {
-		summaryByURL[summary.URL] = summary
+		summaryByKey[summaryKey(summary.URL, summary.Method)] = summary
 	}
-	analyze.MarkInteresting(results, summaryByURL)
+	analyze.MarkInteresting(results, summaryByKey)
 
+	multiMethod := len(cfg.Methods) > 1
 	for _, summary := range summaries {
 		if summary.Interesting {
-			fmt.Printf("[!] interesting %s score=%d %s\n", summary.URL, summary.Score, analyze.ConsoleStatus(summary))
+			prefix := "[!] interesting"
+			if multiMethod {
+				fmt.Printf("%s %s %s score=%d %s\n", prefix, summary.Method, summary.URL, summary.Score, analyze.ConsoleStatus(summary))
+			} else {
+				fmt.Printf("%s %s score=%d %s\n", prefix, summary.URL, summary.Score, analyze.ConsoleStatus(summary))
+			}
 			if cfg.Verbose {
 				fmt.Printf("    reason: %s\n", summary.Reason)
 			}
@@ -161,7 +164,55 @@ func run(args []string) error {
 	return nil
 }
 
-func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, urls []string, headers http.Header, bodies map[string][]byte) []result.Request {
+type variant struct {
+	Name         string // display name / VariantName
+	ContentType  string // header to send; "" when OmitCT is true
+	OmitCT       bool
+	BodyEncoding string
+	Body         []byte
+}
+
+func buildVariants(cfg config.Config, basePayload map[string]any) ([]variant, error) {
+	out := make([]variant, 0, len(cfg.Types)+len(render.MismatchScenarios))
+	// Natural variants: one per --types entry, body matches header family.
+	for _, ct := range cfg.Types {
+		body, err := render.Body(ct, basePayload)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(body)) > cfg.MaxRequestBody {
+			return nil, fmt.Errorf("%s request body exceeds %d bytes", ct, cfg.MaxRequestBody)
+		}
+		out = append(out, variant{
+			Name:         ct,
+			ContentType:  ct,
+			BodyEncoding: render.EncodingFor(ct),
+			Body:         body,
+		})
+	}
+	// Mismatch variants: body encoding deliberately disagrees with header.
+	if cfg.Mismatch {
+		for _, s := range render.MismatchScenarios {
+			body, err := render.BodyAs(s.Encoding, basePayload)
+			if err != nil {
+				return nil, err
+			}
+			if int64(len(body)) > cfg.MaxRequestBody {
+				return nil, fmt.Errorf("mismatch %s body exceeds %d bytes", s.Name, cfg.MaxRequestBody)
+			}
+			out = append(out, variant{
+				Name:         s.Name,
+				ContentType:  s.Header,
+				OmitCT:       s.Header == "",
+				BodyEncoding: s.Encoding,
+				Body:         body,
+			})
+		}
+	}
+	return out, nil
+}
+
+func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, urls []string, headers http.Header, variants []variant) []result.Request {
 	jobs := make(chan job)
 	resultsCh := make(chan result.Request)
 
@@ -174,15 +225,20 @@ func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, 
 				req := httpclient.RequestSpec{
 					Seq:         item.seq,
 					URL:         item.url,
-					Method:      cfg.Method,
+					Method:      item.method,
 					ContentType: item.contentType,
+					OmitCT:      item.omitCT,
 					Body:        item.body,
 					Headers:     headers,
 				}
 				res := client.Do(ctx, req)
+				res.Method = item.method
+				res.ContentType = item.contentType
+				res.VariantName = item.variant
+				res.BodyEncoding = item.bodyEncoding
 				resultsCh <- res
 				if cfg.Verbose {
-					fmt.Printf("[.] %s %s %s status=%d error=%q\n", cfg.Method, item.url, render.ShortName(item.contentType), res.Status, res.Error)
+					fmt.Printf("[.] %s %s %s status=%d error=%q\n", item.method, item.url, item.variant, res.Status, res.Error)
 				}
 				if cfg.Delay > 0 {
 					time.Sleep(cfg.Delay)
@@ -197,19 +253,25 @@ func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, 
 		seq := 0
 		for _, targetURL := range urls {
 			host := hostKey(targetURL)
-			for _, contentType := range cfg.Types {
-				if cfg.MaxRequestsPerHost > 0 && hostCount[host] >= cfg.MaxRequestsPerHost {
-					skipped++
-					continue
+			for _, method := range cfg.Methods {
+				for _, v := range variants {
+					if cfg.MaxRequestsPerHost > 0 && hostCount[host] >= cfg.MaxRequestsPerHost {
+						skipped++
+						continue
+					}
+					hostCount[host]++
+					jobs <- job{
+						seq:          seq,
+						url:          targetURL,
+						method:       method,
+						variant:      v.Name,
+						contentType:  v.ContentType,
+						omitCT:       v.OmitCT,
+						bodyEncoding: v.BodyEncoding,
+						body:         v.Body,
+					}
+					seq++
 				}
-				hostCount[host]++
-				jobs <- job{
-					seq:         seq,
-					url:         targetURL,
-					contentType: contentType,
-					body:        bodies[contentType],
-				}
-				seq++
 			}
 		}
 		close(jobs)
@@ -217,7 +279,7 @@ func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, 
 		close(resultsCh)
 	}()
 
-	results := make([]result.Request, 0, len(urls)*len(cfg.Types))
+	results := make([]result.Request, 0, len(urls)*len(cfg.Methods)*len(variants))
 	for res := range resultsCh {
 		results = append(results, res)
 	}
@@ -302,32 +364,41 @@ func hostKey(raw string) string {
 }
 
 type runPlan struct {
-	Hosts     []string
-	PerHost   map[string]int
-	PerType   map[string]int
-	URLs      int
-	Types     int
-	Requests  int
-	Method    string
-	DryRun    bool
-	CanaryTag string
+	Hosts           []string
+	PerHost         map[string]int
+	URLs            int
+	Types           int
+	MismatchCount   int
+	VariantsPerURL  int
+	Methods         []string
+	Requests        int
+	DryRun          bool
+	CanaryTag       string
 }
 
 func buildPlan(cfg config.Config, urls []string) runPlan {
+	mismatchCount := 0
+	if cfg.Mismatch {
+		mismatchCount = len(render.MismatchScenarios)
+	}
+	variantsPerURL := len(cfg.Types) + mismatchCount
+	perURLRequests := variantsPerURL * len(cfg.Methods)
+
 	plan := runPlan{
-		PerHost:  map[string]int{},
-		PerType:  map[string]int{},
-		URLs:     len(urls),
-		Types:    len(cfg.Types),
-		Method:   cfg.Method,
-		DryRun:   cfg.DryRun,
-		CanaryTag: cfg.Canary,
+		PerHost:        map[string]int{},
+		URLs:           len(urls),
+		Types:          len(cfg.Types),
+		MismatchCount:  mismatchCount,
+		VariantsPerURL: variantsPerURL,
+		Methods:        cfg.Methods,
+		DryRun:         cfg.DryRun,
+		CanaryTag:      cfg.Canary,
 	}
 	hosts := map[string]struct{}{}
 	for _, u := range urls {
 		host := hostKey(u)
 		hosts[host] = struct{}{}
-		n := len(cfg.Types)
+		n := perURLRequests
 		if cfg.MaxRequestsPerHost > 0 {
 			remaining := cfg.MaxRequestsPerHost - plan.PerHost[host]
 			if remaining < 0 {
@@ -339,9 +410,6 @@ func buildPlan(cfg config.Config, urls []string) runPlan {
 		}
 		plan.PerHost[host] += n
 		plan.Requests += n
-	}
-	for _, ct := range cfg.Types {
-		plan.PerType[ct] = plan.URLs
 	}
 	plan.Hosts = make([]string, 0, len(hosts))
 	for h := range hosts {
@@ -356,8 +424,14 @@ func printRunPlan(plan runPlan, cfg config.Config, basePayload map[string]any) {
 	if plan.DryRun {
 		heading = "[+] dry-run plan"
 	}
-	fmt.Printf("%s: %s %d urls × %d content-types = %d requests across %d host(s)\n",
-		heading, plan.Method, plan.URLs, plan.Types, plan.Requests, len(plan.Hosts))
+	methodList := strings.Join(plan.Methods, ",")
+	fmt.Printf("%s: methods=%s %d urls × %d variants",
+		heading, methodList, plan.URLs, plan.VariantsPerURL)
+	if plan.MismatchCount > 0 {
+		fmt.Printf(" (%d base + %d mismatch)", plan.Types, plan.MismatchCount)
+	}
+	fmt.Printf(" × %d methods = %d requests across %d host(s)\n",
+		len(plan.Methods), plan.Requests, len(plan.Hosts))
 	if cfg.MaxRequestsPerHost > 0 {
 		fmt.Printf("    per-host cap: %d\n", cfg.MaxRequestsPerHost)
 	}
@@ -367,9 +441,15 @@ func printRunPlan(plan runPlan, cfg config.Config, basePayload map[string]any) {
 	if cfg.Canary != "" {
 		fmt.Printf("    canary: %s\n", cfg.Canary)
 	}
-	if isMutatingMethod(plan.Method) {
+	mutating := []string{}
+	for _, m := range plan.Methods {
+		if isMutatingMethod(m) {
+			mutating = append(mutating, m)
+		}
+	}
+	if len(mutating) > 0 {
 		fmt.Printf("[!] %s requests will send a %d-key payload body to each target; this may mutate target state\n",
-			plan.Method, len(basePayload))
+			strings.Join(mutating, ","), len(basePayload))
 	}
 	if plan.DryRun {
 		for _, host := range plan.Hosts {
@@ -387,15 +467,27 @@ func isMutatingMethod(m string) bool {
 	}
 }
 
-func summarize(urls []string, requests []result.Request) []result.Summary {
-	grouped := make(map[string][]result.Request, len(urls))
+func summaryKey(url, method string) string {
+	return analyze.SummaryKey(url, method)
+}
+
+func summarize(urls, methods []string, requests []result.Request) []result.Summary {
+	grouped := make(map[string][]result.Request, len(urls)*len(methods))
 	for _, req := range requests {
-		grouped[req.URL] = append(grouped[req.URL], req)
+		grouped[analyze.SummaryKey(req.URL, req.Method)] = append(grouped[analyze.SummaryKey(req.URL, req.Method)], req)
 	}
 
-	summaries := make([]result.Summary, 0, len(urls))
+	summaries := make([]result.Summary, 0, len(urls)*len(methods))
 	for _, targetURL := range urls {
-		summaries = append(summaries, analyze.Summarize(targetURL, grouped[targetURL]))
+		for _, method := range methods {
+			key := analyze.SummaryKey(targetURL, method)
+			if len(grouped[key]) == 0 {
+				continue
+			}
+			s := analyze.Summarize(targetURL, grouped[key])
+			s.Method = method
+			summaries = append(summaries, s)
+		}
 	}
 	return summaries
 }

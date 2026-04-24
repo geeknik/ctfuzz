@@ -339,6 +339,70 @@ func ShortName(contentType string) string {
 	}
 }
 
+// MismatchScenario describes a deliberate body/Content-Type disagreement.
+// Header may be the empty string, meaning "omit the Content-Type header".
+type MismatchScenario struct {
+	Name     string
+	Encoding string // "json", "xml", or "form"
+	Header   string // Content-Type value to send, or "" to omit
+}
+
+// MismatchScenarios is the fixed set of body/CT disagreements worth probing.
+// Additive when --mismatch is set; each scenario becomes one extra request
+// per URL per method.
+var MismatchScenarios = []MismatchScenario{
+	{Name: "json-as-xml", Encoding: "json", Header: ContentTypeXML},
+	{Name: "json-as-form", Encoding: "json", Header: ContentTypeForm},
+	{Name: "json-as-plain", Encoding: "json", Header: ContentTypePlain},
+	{Name: "json-no-header", Encoding: "json", Header: ""},
+	{Name: "xml-as-json", Encoding: "xml", Header: ContentTypeJSON},
+	{Name: "xml-as-form", Encoding: "xml", Header: ContentTypeForm},
+	{Name: "form-as-json", Encoding: "form", Header: ContentTypeJSON},
+	{Name: "form-as-xml", Encoding: "form", Header: ContentTypeXML},
+	{Name: "form-no-header", Encoding: "form", Header: ""},
+}
+
+// EncodingFor returns the short encoding name ("json"/"xml"/"form"/etc.)
+// implied by a content type, or "unknown" for unmapped values.
+func EncodingFor(contentType string) string {
+	kind, err := rendererFor(contentType)
+	if err != nil {
+		return "unknown"
+	}
+	switch kind {
+	case renderJSON:
+		return "json"
+	case renderNDJSON:
+		return "ndjson"
+	case renderXML:
+		return "xml"
+	case renderForm:
+		return "form"
+	case renderMultipart:
+		return "multipart"
+	case renderYAML:
+		return "yaml"
+	default:
+		return "unknown"
+	}
+}
+
+// BodyAs renders a payload using the named encoding, independent of any
+// Content-Type header. Used by mismatch mode to force a specific body
+// shape.
+func BodyAs(encoding string, payload map[string]any) ([]byte, error) {
+	switch encoding {
+	case "json":
+		return JSON(payload)
+	case "xml":
+		return XML(payload, "root")
+	case "form":
+		return Form(payload)
+	default:
+		return nil, fmt.Errorf("unsupported mismatch encoding %q", encoding)
+	}
+}
+
 func JSON(payload map[string]any) ([]byte, error) {
 	return json.Marshal(payload)
 }

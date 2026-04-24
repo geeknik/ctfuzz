@@ -8,6 +8,67 @@ import (
 	"testing"
 )
 
+func TestEncodingForCoreTypes(t *testing.T) {
+	cases := map[string]string{
+		ContentTypeJSON:           "json",
+		ContentTypeXML:            "xml",
+		ContentTypeForm:           "form",
+		ContentTypeMultipart:      "multipart",
+		ContentTypeYAML:           "yaml",
+		ContentTypeNDJSON:         "ndjson",
+		"application/unknown-xyz": "unknown",
+	}
+	for ct, want := range cases {
+		if got := EncodingFor(ct); got != want {
+			t.Fatalf("%s: got %q want %q", ct, got, want)
+		}
+	}
+}
+
+func TestBodyAsIgnoresHeader(t *testing.T) {
+	payload := map[string]any{"a": "b"}
+	j, err := BodyAs("json", payload)
+	if err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if string(j) != `{"a":"b"}` {
+		t.Fatalf("json body: %s", j)
+	}
+	x, err := BodyAs("xml", payload)
+	if err != nil {
+		t.Fatalf("xml: %v", err)
+	}
+	if !strings.Contains(string(x), "<a>b</a>") {
+		t.Fatalf("xml body: %s", x)
+	}
+	f, err := BodyAs("form", payload)
+	if err != nil {
+		t.Fatalf("form: %v", err)
+	}
+	if string(f) != "a=b" {
+		t.Fatalf("form body: %s", f)
+	}
+	if _, err := BodyAs("multipart", payload); err == nil {
+		t.Fatal("expected unsupported encoding error")
+	}
+}
+
+func TestMismatchScenariosUniqueNames(t *testing.T) {
+	seen := map[string]struct{}{}
+	for _, s := range MismatchScenarios {
+		if _, ok := seen[s.Name]; ok {
+			t.Fatalf("duplicate scenario name %q", s.Name)
+		}
+		seen[s.Name] = struct{}{}
+		if s.Encoding != "json" && s.Encoding != "xml" && s.Encoding != "form" {
+			t.Fatalf("%s: unexpected encoding %q", s.Name, s.Encoding)
+		}
+	}
+	if len(MismatchScenarios) < 6 {
+		t.Fatalf("expected at least 6 mismatch scenarios, got %d", len(MismatchScenarios))
+	}
+}
+
 func TestJSONRendererEmitsValidJSON(t *testing.T) {
 	body, err := JSON(map[string]any{"id": json.Number("1"), "name": "ctfuzz"})
 	if err != nil {

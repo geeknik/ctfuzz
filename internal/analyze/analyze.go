@@ -20,7 +20,7 @@ type signal struct {
 func Summarize(targetURL string, requests []result.Request) result.Summary {
 	statuses := make(map[string]int, len(requests))
 	for _, req := range requests {
-		statuses[req.ContentType] = req.Status
+		statuses[variantKey(req)] = req.Status
 	}
 
 	signals := collect(requests)
@@ -53,9 +53,16 @@ func Summarize(targetURL string, requests []result.Request) result.Summary {
 	return summary
 }
 
+// SummaryKey identifies a per-(URL, method) summary bucket. Kept here so
+// main.go and tests don't have to rebuild the key format.
+func SummaryKey(url, method string) string {
+	return method + " " + url
+}
+
 func MarkInteresting(requests []result.Request, summaries map[string]result.Summary) {
 	for i := range requests {
-		requests[i].Interesting = summaries[requests[i].URL].Interesting
+		key := SummaryKey(requests[i].URL, requests[i].Method)
+		requests[i].Interesting = summaries[key].Interesting
 	}
 }
 
@@ -149,6 +156,20 @@ func collect(requests []result.Request) []signal {
 		out = append(out, signal{score: 5, reason: "response time differs by more than 3x"})
 	}
 	return out
+}
+
+// variantKey returns the string used to uniquely identify a request variant
+// inside a per-(URL, method) cluster. For matching Content-Type requests this
+// is the Content-Type header; for mismatch variants it is the scenario name
+// (e.g., "json-as-xml") so two variants sharing a header don't collide.
+func variantKey(req result.Request) string {
+	if req.VariantName != "" {
+		return req.VariantName
+	}
+	if req.ContentType != "" {
+		return req.ContentType
+	}
+	return "(no-content-type)"
 }
 
 func hasReportableSignal(signals []signal) bool {

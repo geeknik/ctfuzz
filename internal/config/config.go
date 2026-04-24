@@ -34,6 +34,8 @@ type Config struct {
 	MaxRequestsPerHost int
 	CanaryPrefix       string
 	Method             string
+	Methods            []string
+	Mismatch           bool
 	Concurrency        int
 	Timeout            time.Duration
 	Delay              time.Duration
@@ -72,7 +74,10 @@ func Parse(args []string, output io.Writer) (Config, error) {
 	fs.StringVar(&cfg.PayloadFile, "payload", "", "base JSON object payload file")
 	fs.StringVar(&cfg.HeadersFile, "headers", "", "static HTTP headers file")
 	fs.StringVar(&cfg.OutputFile, "out", DefaultOutput, "JSONL output file")
-	fs.StringVar(&cfg.Method, "method", "POST", "HTTP method")
+	fs.StringVar(&cfg.Method, "method", "POST", "single HTTP method (use --methods for a comma list)")
+	var rawMethods string
+	fs.StringVar(&rawMethods, "methods", "", "comma-separated HTTP methods; overrides --method when set (e.g. POST,PUT,PATCH,DELETE,GET)")
+	fs.BoolVar(&cfg.Mismatch, "mismatch", false, "additive mismatch mode: send body/Content-Type disagreements (json-as-xml, form-no-header, etc.)")
 	fs.IntVar(&cfg.Concurrency, "concurrency", DefaultConcurrency, "parallel workers")
 	fs.DurationVar(&cfg.Timeout, "timeout", DefaultTimeout, "per-request timeout")
 	fs.DurationVar(&cfg.Delay, "delay", DefaultDelay, "delay between requests per worker")
@@ -107,10 +112,46 @@ func Parse(args []string, output io.Writer) (Config, error) {
 	}
 	cfg.Types = types
 
+	methods, err := parseMethods(rawMethods, cfg.Method)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Methods = methods
+
 	if err := cfg.normalize(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func parseMethods(raw, singular string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		m := strings.ToUpper(strings.TrimSpace(singular))
+		if !allowedMethod(m) {
+			return nil, fmt.Errorf("unsupported HTTP method %q", singular)
+		}
+		return []string{m}, nil
+	}
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, part := range strings.Split(raw, ",") {
+		m := strings.ToUpper(strings.TrimSpace(part))
+		if m == "" {
+			return nil, errors.New("--methods contains an empty item")
+		}
+		if !allowedMethod(m) {
+			return nil, fmt.Errorf("unsupported HTTP method %q", part)
+		}
+		if _, ok := seen[m]; ok {
+			continue
+		}
+		seen[m] = struct{}{}
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("--methods must include at least one method")
+	}
+	return out, nil
 }
 
 func (c *Config) normalize() error {

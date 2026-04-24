@@ -31,6 +31,41 @@ func TestParseTypesCorePreservesOriginalTrio(t *testing.T) {
 	}
 }
 
+func TestParseMethodsDefaultFromSingular(t *testing.T) {
+	got, err := parseMethods("", "post")
+	if err != nil {
+		t.Fatalf("parseMethods: %v", err)
+	}
+	if len(got) != 1 || got[0] != "POST" {
+		t.Fatalf("expected [POST], got %v", got)
+	}
+}
+
+func TestParseMethodsCommaListDeduplicated(t *testing.T) {
+	got, err := parseMethods("POST, put ,PATCH,post", "POST")
+	if err != nil {
+		t.Fatalf("parseMethods: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 deduped methods, got %v", got)
+	}
+	want := []string{"POST", "PUT", "PATCH"}
+	for i, m := range want {
+		if got[i] != m {
+			t.Fatalf("pos %d: got %q want %q", i, got[i], m)
+		}
+	}
+}
+
+func TestParseMethodsRejectsBogus(t *testing.T) {
+	cases := []string{"PROPFIND", "", "FOO,BAR", "POST, ,PUT"}
+	for _, raw := range cases {
+		if _, err := parseMethods(raw, "POST"); err == nil && raw != "" {
+			t.Fatalf("expected %q to be rejected", raw)
+		}
+	}
+}
+
 func TestParseTypesSupportsExactSuffixType(t *testing.T) {
 	types, err := parseTypes("application/scim+json")
 	if err != nil {

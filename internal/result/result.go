@@ -5,6 +5,8 @@ type Request struct {
 	URL              string            `json:"url"`
 	Method           string            `json:"method"`
 	ContentType      string            `json:"content_type"`
+	BodyEncoding     string            `json:"body_encoding,omitempty"`
+	VariantName      string            `json:"variant,omitempty"`
 	Status           int               `json:"status"`
 	DurationMS       int64             `json:"duration_ms"`
 	ResponseLen      int64             `json:"response_len"`
@@ -22,6 +24,7 @@ type Request struct {
 
 type Summary struct {
 	URL          string         `json:"url"`
+	Method       string         `json:"method,omitempty"`
 	Kind         string         `json:"kind"`
 	Interesting  bool           `json:"interesting"`
 	Score        int            `json:"score"`
