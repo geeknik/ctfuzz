@@ -116,6 +116,11 @@ func New(cfg Config) (*Client, error) {
 			if c.allowRedirect != nil && !c.allowRedirect(req.URL) {
 				return fmt.Errorf("%w: %s", errRedirectOutOfScope, req.URL.Host)
 			}
+			// Redirect hops are real requests to a real host and must draw
+			// from that host's rate bucket, not ride the origin's token.
+			if err := c.limiter.Acquire(req.Context(), limiterHost(req.URL)); err != nil {
+				return err
+			}
 			return nil
 		}
 	}
@@ -137,7 +142,7 @@ func (c *Client) Do(parent context.Context, spec RequestSpec) result.Request {
 		header.Error = "invalid target url"
 		return header
 	}
-	host := strings.ToLower(reqURL.Host)
+	host := limiterHost(reqURL)
 
 	attempts := c.retries + 1
 	var last result.Request
@@ -254,7 +259,20 @@ func readLimited(r io.Reader, maxBytes int64) ([]byte, bool, error) {
 	return data, false, nil
 }
 
+func limiterHost(u *url.URL) string {
+	// Buckets key on the hostname — the same notion of "host" as
+	// --max-requests-per-host and --scope-file — so ports and schemes
+	// share one bucket instead of each getting a fresh burst.
+	return strings.ToLower(u.Hostname())
+}
+
 func classifyRequestError(err error) string {
+	if errors.Is(err, errRedirectOutOfScope) {
+		return "redirect out of scope"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "request canceled"
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "request timed out"
 	}

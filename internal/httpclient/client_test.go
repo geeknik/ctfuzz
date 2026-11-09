@@ -211,6 +211,93 @@ func TestClientBlocksOutOfScope307Redirect(t *testing.T) {
 	}
 }
 
+func TestRateLimiterPacesRedirectHops(t *testing.T) {
+	// rps=1, burst=1: the original request drains the host's only token, so
+	// a redirect hop back to the same host must wait ~1s for the next one.
+	// Pre-fix, hops bypassed the limiter entirely and the chain was instant.
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/landed", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c, err := New(Config{
+		Timeout:           5 * time.Second,
+		MaxBodyRead:       1024,
+		FollowRedirects:   true,
+		RequestsPerSecond: 1,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	start := time.Now()
+	res := c.Do(context.Background(), RequestSpec{
+		URL:         server.URL + "/start",
+		Method:      "POST",
+		ContentType: "application/json",
+		Body:        []byte("{}"),
+	})
+	elapsed := time.Since(start)
+
+	if res.Error != "" {
+		t.Fatalf("expected redirect chain to complete, got error=%q", res.Error)
+	}
+	if res.Status != http.StatusOK {
+		t.Fatalf("expected final status 200, got %d", res.Status)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("expected 2 server hits (start + hop), got %d", got)
+	}
+	if elapsed < 400*time.Millisecond {
+		t.Fatalf("redirect hop bypassed the rate limiter: chain finished in %v, want >= 400ms", elapsed)
+	}
+}
+
+func TestRateLimiterBucketsArePerHostnameNotPort(t *testing.T) {
+	// The docs and --max-requests-per-host treat "host" as the hostname;
+	// the limiter must too, so two ports on the same host share one bucket
+	// instead of each getting a fresh burst.
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s1.Close()
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s2.Close()
+
+	c, err := New(Config{
+		Timeout:           5 * time.Second,
+		MaxBodyRead:       1024,
+		RequestsPerSecond: 1, // burst 1
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	res1 := c.Do(context.Background(), RequestSpec{URL: s1.URL + "/a", Method: "POST", ContentType: "application/json", Body: []byte("{}")})
+	if res1.Error != "" {
+		t.Fatalf("first request: %q", res1.Error)
+	}
+
+	start := time.Now()
+	res2 := c.Do(context.Background(), RequestSpec{URL: s2.URL + "/b", Method: "POST", ContentType: "application/json", Body: []byte("{}")})
+	elapsed := time.Since(start)
+
+	if res2.Error != "" {
+		t.Fatalf("second request: %q", res2.Error)
+	}
+	if elapsed < 400*time.Millisecond {
+		t.Fatalf("same-hostname different-port request got a fresh bucket (finished in %v); buckets must key on hostname", elapsed)
+	}
+}
+
 func TestJitteredBackoffBounds(t *testing.T) {
 	base := 100 * time.Millisecond
 	for attempt := 1; attempt <= 8; attempt++ {

@@ -88,7 +88,10 @@ ctfuzz assumes it is being pointed at live targets that an operator cares
 about. The defaults reflect that posture:
 
 - No redirect following, no retries, bounded concurrency (8), 10s timeout.
-- `--rps 0` (off) — set this explicitly for real targets.
+- `--rps 0` (off) — set this explicitly for real targets. When set, the
+  token bucket is per **hostname** (ports and schemes share one bucket,
+  matching `--max-requests-per-host`), and redirect hops draw from their
+  own target host's bucket rather than riding the origin's token.
 - `--scope-file` enforces a host allowlist. Any out-of-scope URL aborts
   the run with exit code 3 unless `--allow-scope-drops` is set. With
   `--follow-redirects`, every redirect hop is re-checked against the same
