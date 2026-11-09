@@ -4,10 +4,212 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestClientBlocksOutOfScopeRedirect(t *testing.T) {
+	var targetHits, leakHits atomic.Int32
+	leak := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakHits.Add(1)
+		_, _ = w.Write([]byte("leaked"))
+	}))
+	defer leak.Close()
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		http.Redirect(w, r, leak.URL+"/", http.StatusFound)
+	}))
+	defer target.Close()
+
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatalf("parse target url: %v", err)
+	}
+
+	c, err := New(Config{
+		Timeout:         2 * time.Second,
+		MaxBodyRead:     4096,
+		FollowRedirects: true,
+		Retries:         2,
+		RetryBackoff:    5 * time.Millisecond,
+		AllowRedirect: func(u *url.URL) bool {
+			return u.Host == targetURL.Host
+		},
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	res := c.Do(context.Background(), RequestSpec{
+		URL:         target.URL + "/",
+		Method:      "POST",
+		ContentType: "application/json",
+		Body:        []byte("{}"),
+	})
+
+	if got := leakHits.Load(); got != 0 {
+		t.Fatalf("out-of-scope redirect target was hit %d time(s)", got)
+	}
+	if got := targetHits.Load(); got != 1 {
+		t.Fatalf("scope-blocked redirect must not be retried; target hit %d times", got)
+	}
+	if res.Error != "redirect out of scope" {
+		t.Fatalf("expected error %q, got %q", "redirect out of scope", res.Error)
+	}
+	if res.Status != http.StatusFound {
+		t.Fatalf("expected blocked hop to record status 302, got %d", res.Status)
+	}
+	if res.RedirectLocation != leak.URL+"/" {
+		t.Fatalf("expected blocked hop to record Location, got %q", res.RedirectLocation)
+	}
+}
+
+func TestClientFollowsRedirectWithoutPolicy(t *testing.T) {
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("final"))
+	}))
+	defer final.Close()
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/", http.StatusFound)
+	}))
+	defer target.Close()
+
+	c, err := New(Config{
+		Timeout:         2 * time.Second,
+		MaxBodyRead:     4096,
+		FollowRedirects: true,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	res := c.Do(context.Background(), RequestSpec{
+		URL:         target.URL + "/",
+		Method:      "POST",
+		ContentType: "application/json",
+		Body:        []byte("{}"),
+	})
+	if res.Error != "" {
+		t.Fatalf("expected redirect without policy to be followed, got error=%q", res.Error)
+	}
+	if res.Status != http.StatusOK {
+		t.Fatalf("expected final status 200, got %d", res.Status)
+	}
+}
+
+func TestClientBlocksOutOfScopeRedirectAfterInScopeHop(t *testing.T) {
+	// A (in scope) -> B (in scope) -> leak (out of scope): the chain must be
+	// gated per hop, not just on the first Location.
+	var leakHits atomic.Int32
+	leak := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakHits.Add(1)
+		_, _ = w.Write([]byte("leaked"))
+	}))
+	defer leak.Close()
+
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, leak.URL+"/", http.StatusFound)
+	}))
+	defer b.Close()
+
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, b.URL+"/", http.StatusFound)
+	}))
+	defer a.Close()
+
+	aURL, err := url.Parse(a.URL)
+	if err != nil {
+		t.Fatalf("parse a url: %v", err)
+	}
+	bURL, err := url.Parse(b.URL)
+	if err != nil {
+		t.Fatalf("parse b url: %v", err)
+	}
+	inScope := map[string]struct{}{aURL.Host: {}, bURL.Host: {}}
+
+	c, err := New(Config{
+		Timeout:         2 * time.Second,
+		MaxBodyRead:     4096,
+		FollowRedirects: true,
+		AllowRedirect: func(u *url.URL) bool {
+			_, ok := inScope[u.Host]
+			return ok
+		},
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	res := c.Do(context.Background(), RequestSpec{
+		URL:         a.URL + "/",
+		Method:      "POST",
+		ContentType: "application/json",
+		Body:        []byte("{}"),
+	})
+
+	if got := leakHits.Load(); got != 0 {
+		t.Fatalf("out-of-scope final hop was hit %d time(s)", got)
+	}
+	if res.Error != "redirect out of scope" {
+		t.Fatalf("expected error %q, got %q", "redirect out of scope", res.Error)
+	}
+	if res.Status != http.StatusFound || res.RedirectLocation != leak.URL+"/" {
+		t.Fatalf("expected blocked row to record B's 302 and Location, got status=%d location=%q",
+			res.Status, res.RedirectLocation)
+	}
+}
+
+func TestClientBlocksOutOfScope307Redirect(t *testing.T) {
+	// 307 preserves method and body across the hop; the block must fire
+	// before that re-issued request reaches the out-of-scope host.
+	var leakHits atomic.Int32
+	var leakSawBody atomic.Int32
+	leak := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakHits.Add(1)
+		if r.Method == http.MethodPost && r.ContentLength > 0 {
+			leakSawBody.Add(1)
+		}
+		_, _ = w.Write([]byte("leaked"))
+	}))
+	defer leak.Close()
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, leak.URL+"/", http.StatusTemporaryRedirect)
+	}))
+	defer target.Close()
+
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatalf("parse target url: %v", err)
+	}
+
+	c, err := New(Config{
+		Timeout:         2 * time.Second,
+		MaxBodyRead:     4096,
+		FollowRedirects: true,
+		AllowRedirect:   func(u *url.URL) bool { return u.Host == targetURL.Host },
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	res := c.Do(context.Background(), RequestSpec{
+		URL:         target.URL + "/",
+		Method:      "POST",
+		ContentType: "application/json",
+		Body:        []byte(`{"k":"v"}`),
+	})
+
+	if got := leakHits.Load(); got != 0 {
+		t.Fatalf("out-of-scope 307 target was hit %d time(s) (body seen: %d)", got, leakSawBody.Load())
+	}
+	if res.Error != "redirect out of scope" {
+		t.Fatalf("expected error %q, got %q", "redirect out of scope", res.Error)
+	}
+	if res.Status != http.StatusTemporaryRedirect {
+		t.Fatalf("expected blocked row to record status 307, got %d", res.Status)
+	}
+}
 
 func TestJitteredBackoffBounds(t *testing.T) {
 	base := 100 * time.Millisecond

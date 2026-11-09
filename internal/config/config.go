@@ -83,7 +83,7 @@ func Parse(args []string, output io.Writer) (Config, error) {
 	fs.DurationVar(&cfg.Delay, "delay", DefaultDelay, "delay between requests per worker")
 	fs.StringVar(&cfg.Proxy, "proxy", "", "HTTP, HTTPS, SOCKS5, or SOCKS5H proxy URL")
 	fs.BoolVar(&cfg.Insecure, "insecure", false, "skip TLS certificate verification")
-	fs.BoolVar(&cfg.FollowRedirects, "follow-redirects", false, "follow HTTP redirects")
+	fs.BoolVar(&cfg.FollowRedirects, "follow-redirects", false, "follow HTTP redirects; every hop must pass --scope-file when one is set")
 	fs.Int64Var(&cfg.MaxBodyRead, "max-body-read", DefaultMaxBodyRead, "maximum response bytes to fingerprint")
 	fs.Int64Var(&cfg.MaxRequestBody, "max-request-body", DefaultMaxRequestBody, "maximum rendered request body bytes")
 	fs.BoolVar(&cfg.IncludeBody, "include-body", false, "write truncated response bodies to JSONL")

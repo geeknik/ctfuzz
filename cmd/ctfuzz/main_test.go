@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -538,6 +539,106 @@ func TestRunEndToEndAgainstDifferentialServer(t *testing.T) {
 		if got.Interesting != wantInteresting {
 			t.Fatalf("%s interesting mismatch: got %v want %v summary=%#v", targetURL, got.Interesting, wantInteresting, got)
 		}
+	}
+}
+
+// TestFollowRedirectsRechecksScopeOnEveryHop guards the safety contract that
+// --scope-file gates not just the input URLs but every redirect hop when
+// --follow-redirects is enabled. The in-scope target is rebound to the
+// "localhost" host so the host-based (port-insensitive) scope matcher can
+// distinguish it from the leak server's 127.0.0.1.
+func TestFollowRedirectsRechecksScopeOnEveryHop(t *testing.T) {
+	var leakHits atomic.Int32
+	leak := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakHits.Add(1)
+		_, _ = w.Write([]byte("leaked"))
+	}))
+	defer leak.Close()
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, leak.URL+"/leaked", http.StatusFound)
+	}))
+	defer target.Close()
+
+	u, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatalf("parse target url: %v", err)
+	}
+	u.Host = "localhost:" + u.Port()
+	targetURL := u.String() + "/api"
+
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	scopePath := filepath.Join(dir, "scope.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+
+	if err := os.WriteFile(urlsPath, []byte(targetURL+"\n"), 0600); err != nil {
+		t.Fatalf("write urls: %v", err)
+	}
+	if err := os.WriteFile(scopePath, []byte("localhost\n"), 0600); err != nil {
+		t.Fatalf("write scope: %v", err)
+	}
+	if err := os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	if _, err := run([]string{
+		"--urls", urlsPath,
+		"--scope-file", scopePath,
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--follow-redirects",
+		"--types", "application/json",
+		"--timeout", "2s",
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if got := leakHits.Load(); got != 0 {
+		t.Fatalf("out-of-scope redirect target was hit %d time(s); scope must gate every hop", got)
+	}
+
+	type requestRow struct {
+		Status           int    `json:"status"`
+		RedirectLocation string `json:"redirect_location"`
+		Error            string `json:"error"`
+	}
+	rows := []requestRow{}
+	f, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("open output: %v", err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var raw map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("decode jsonl: %v", err)
+		}
+		if raw["kind"] == "summary" || raw["kind"] == "manifest" {
+			continue
+		}
+		var row requestRow
+		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
+			t.Fatalf("decode request row: %v", err)
+		}
+		rows = append(rows, row)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan output: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 request row, got %d", len(rows))
+	}
+	if rows[0].Error != "redirect out of scope" {
+		t.Fatalf("expected error %q, got %q", "redirect out of scope", rows[0].Error)
+	}
+	if rows[0].Status != http.StatusFound {
+		t.Fatalf("expected blocked row to record status 302, got %d", rows[0].Status)
+	}
+	if rows[0].RedirectLocation != leak.URL+"/leaked" {
+		t.Fatalf("expected blocked row to record the redirect location, got %q", rows[0].RedirectLocation)
 	}
 }
 

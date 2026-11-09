@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,10 @@ import (
 	"ctfuzz/internal/fingerprint"
 	"ctfuzz/internal/result"
 )
+
+// errRedirectOutOfScope marks a redirect chain aborted because a hop was
+// rejected by the operator's redirect policy (scope allowlist).
+var errRedirectOutOfScope = errors.New("redirect out of scope")
 
 type Config struct {
 	Timeout           time.Duration
@@ -27,17 +32,22 @@ type Config struct {
 	Retries           int
 	RetryBackoff      time.Duration
 	RequestsPerSecond float64
+	// AllowRedirect, when non-nil, is consulted for every redirect hop
+	// while FollowRedirects is enabled. Returning false aborts the chain
+	// before the out-of-scope request is issued.
+	AllowRedirect func(*url.URL) bool
 }
 
 type Client struct {
-	httpClient   *http.Client
-	timeout      time.Duration
-	maxBodyRead  int64
-	includeBody  bool
-	canary       string
-	retries      int
-	retryBackoff time.Duration
-	limiter      *hostLimiter
+	httpClient    *http.Client
+	timeout       time.Duration
+	maxBodyRead   int64
+	includeBody   bool
+	canary        string
+	retries       int
+	retryBackoff  time.Duration
+	limiter       *hostLimiter
+	allowRedirect func(*url.URL) bool
 }
 
 type RequestSpec struct {
@@ -73,20 +83,6 @@ func New(cfg Config) (*Client, error) {
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
 
-	client := &http.Client{Transport: transport}
-	if !cfg.FollowRedirects {
-		client.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-	} else {
-		client.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return errors.New("stopped after 10 redirects")
-			}
-			return nil
-		}
-	}
-
 	retries := cfg.Retries
 	if retries < 0 {
 		retries = 0
@@ -96,16 +92,36 @@ func New(cfg Config) (*Client, error) {
 		backoff = 250 * time.Millisecond
 	}
 
-	return &Client{
-		httpClient:   client,
-		timeout:      cfg.Timeout,
-		maxBodyRead:  cfg.MaxBodyRead,
-		includeBody:  cfg.IncludeBody,
-		canary:       cfg.Canary,
-		retries:      retries,
-		retryBackoff: backoff,
-		limiter:      newHostLimiter(cfg.RequestsPerSecond),
-	}, nil
+	c := &Client{
+		timeout:       cfg.Timeout,
+		maxBodyRead:   cfg.MaxBodyRead,
+		includeBody:   cfg.IncludeBody,
+		canary:        cfg.Canary,
+		retries:       retries,
+		retryBackoff:  backoff,
+		limiter:       newHostLimiter(cfg.RequestsPerSecond),
+		allowRedirect: cfg.AllowRedirect,
+	}
+
+	client := &http.Client{Transport: transport}
+	if !cfg.FollowRedirects {
+		client.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	} else {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			if c.allowRedirect != nil && !c.allowRedirect(req.URL) {
+				return fmt.Errorf("%w: %s", errRedirectOutOfScope, req.URL.Host)
+			}
+			return nil
+		}
+	}
+
+	c.httpClient = client
+	return c, nil
 }
 
 func (c *Client) Do(parent context.Context, spec RequestSpec) result.Request {
@@ -164,6 +180,17 @@ func (c *Client) attempt(parent context.Context, spec RequestSpec) (result.Reque
 	resp, err := c.httpClient.Do(req)
 	res.DurationMS = time.Since(start).Milliseconds()
 	if err != nil {
+		if errors.Is(err, errRedirectOutOfScope) {
+			// The HTTP client hands back the redirecting response alongside
+			// the error; its body is already closed, but the status and
+			// Location are safe to read and worth recording for triage.
+			res.Error = errRedirectOutOfScope.Error()
+			if resp != nil {
+				res.Status = resp.StatusCode
+				res.RedirectLocation = resp.Header.Get("Location")
+			}
+			return res, false
+		}
 		res.Error = classifyRequestError(err)
 		return res, isRetryableErr(err)
 	}
@@ -239,6 +266,9 @@ func classifyRequestError(err error) string {
 
 func isRetryableErr(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, errRedirectOutOfScope) {
 		return false
 	}
 	if errors.Is(err, context.Canceled) {

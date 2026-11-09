@@ -157,11 +157,13 @@ func run(args []string) (bool, error) {
 	}
 	fmt.Printf("[+] loaded %d urls\n", len(urls))
 
+	var matcher *scope.Matcher
 	if cfg.ScopeFile != "" {
-		matcher, err := scope.Load(cfg.ScopeFile)
+		m, err := scope.Load(cfg.ScopeFile)
 		if err != nil {
 			return false, fmt.Errorf("scope file: %w", err)
 		}
+		matcher = m
 		kept, dropped := applyScope(matcher, urls)
 		if len(dropped) > 0 {
 			fmt.Fprintf(os.Stderr, "[!] scope filter dropped %d URLs:\n", len(dropped))
@@ -221,6 +223,7 @@ func run(args []string) (bool, error) {
 		Retries:           cfg.Retries,
 		RetryBackoff:      cfg.RetryBackoff,
 		RequestsPerSecond: cfg.RequestsPerSecond,
+		AllowRedirect:     redirectPolicy(matcher),
 	})
 	if err != nil {
 		return false, err
@@ -459,6 +462,18 @@ func applyScope(matcher *scope.Matcher, urls []string) (kept, dropped []string) 
 		}
 	}
 	return kept, dropped
+}
+
+// redirectPolicy returns nil (redirects may go anywhere) when no scope file
+// is in play; otherwise every redirect hop's host is re-checked against the
+// scope allowlist before the hop is issued.
+func redirectPolicy(matcher *scope.Matcher) func(*url.URL) bool {
+	if matcher == nil {
+		return nil
+	}
+	return func(u *url.URL) bool {
+		return matcher.AllowsHost(u.Hostname())
+	}
 }
 
 func hostKey(raw string) string {

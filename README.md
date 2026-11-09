@@ -90,7 +90,13 @@ about. The defaults reflect that posture:
 - No redirect following, no retries, bounded concurrency (8), 10s timeout.
 - `--rps 0` (off) — set this explicitly for real targets.
 - `--scope-file` enforces a host allowlist. Any out-of-scope URL aborts
-  the run with exit code 3 unless `--allow-scope-drops` is set.
+  the run with exit code 3 unless `--allow-scope-drops` is set. With
+  `--follow-redirects`, every redirect hop is re-checked against the same
+  allowlist before the request is issued; a hop to an out-of-scope host
+  aborts that request with a `redirect out of scope` error row that still
+  records the redirecting status and Location. Without a scope file,
+  `--follow-redirects` follows hops anywhere — combine it with
+  `--scope-file` when pointing at targets you don't own.
 - `--max-requests-per-host N` hard-caps blast radius per host.
 - `--dry-run` prints the request matrix and exits without any network
   traffic, including URL counts per host and the total request volume.
