@@ -202,6 +202,15 @@ JSONL, one line per record. The first line is always a manifest.
 Pass `--include-body` to add the (truncated to `--max-body-read`) response
 body to each request record.
 
+### Interruption
+
+`SIGINT` (Ctrl-C) and `SIGTERM` shut the scan down gracefully: no new
+requests are issued, in-flight requests are canceled, and the partial
+results are still written to `--out` (manifest, request rows, summaries)
+with `"interrupted":true` on the manifest line so downstream tooling can
+tell a partial run from a complete one. The process then exits with the
+normal exit codes below. A second Ctrl-C during the flush force-quits.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -211,6 +220,10 @@ body to each request record.
 | 2 | CLI usage error (Go `flag` package default) |
 | 3 | Scope violation — URLs outside `--scope-file` without `--allow-scope-drops` |
 | 4 | Clean run, interesting findings present |
+
+Interrupted runs (SIGINT/SIGTERM) are not errors: they flush partial
+results and exit by the same table — 4 if the partial data contained
+interesting findings, 0 otherwise.
 
 Agent pipelines should treat 3 as "stop, escalate to human" and 4 as
 "trigger triage."

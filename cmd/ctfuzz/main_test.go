@@ -2,18 +2,22 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"ctfuzz/internal/config"
 	"ctfuzz/internal/payload"
@@ -639,6 +643,289 @@ func TestFollowRedirectsRechecksScopeOnEveryHop(t *testing.T) {
 	}
 	if rows[0].RedirectLocation != leak.URL+"/leaked" {
 		t.Fatalf("expected blocked row to record the redirect location, got %q", rows[0].RedirectLocation)
+	}
+}
+
+// TestInterruptStopsScanAndFlushesPartialResults pins the graceful-shutdown
+// contract: a canceled context stops producing new jobs (no phantom
+// "request canceled" rows for work that never started) and the partial
+// results still reach --out with an interrupted manifest.
+func TestInterruptStopsScanAndFlushesPartialResults(t *testing.T) {
+	var hits atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		cancel() // interrupt the scan from inside the first request
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+
+	urls := ""
+	for i := 0; i < 5; i++ {
+		urls += fmt.Sprintf("%s/endpoint%d\n", server.URL, i)
+	}
+	if err := os.WriteFile(urlsPath, []byte(urls), 0600); err != nil {
+		t.Fatalf("write urls: %v", err)
+	}
+	if err := os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	if _, err := runCtx(ctx, []string{
+		"--urls", urlsPath,
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--concurrency", "1",
+		"--timeout", "2s",
+		"--types", "application/json",
+		"--canary", "none",
+	}, func() {}); err != nil {
+		t.Fatalf("runCtx: %v", err)
+	}
+
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 server hit, got %d", got)
+	}
+
+	type manifestRow struct {
+		Kind        string `json:"kind"`
+		Interrupted bool   `json:"interrupted"`
+	}
+	var manifest manifestRow
+	rows := 0
+	f, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("open output: %v", err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var raw map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("decode jsonl: %v", err)
+		}
+		switch raw["kind"] {
+		case "manifest":
+			if err := json.Unmarshal(scanner.Bytes(), &manifest); err != nil {
+				t.Fatalf("decode manifest: %v", err)
+			}
+		case "summary":
+		default:
+			rows++
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan output: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("expected 1 request row (only the work actually started), got %d", rows)
+	}
+	if !manifest.Interrupted {
+		t.Fatal("expected manifest to record interrupted=true for the partial run")
+	}
+}
+
+// TestScanFlushesPartialResultsOnSIGINT is the acceptance test for
+// graceful shutdown: SIGINT to the real binary must stop the scan, flush
+// partial results (manifest interrupted=true), and exit with a normal
+// code rather than dying to the default signal handler.
+func TestScanFlushesPartialResultsOnSIGINT(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs the real binary")
+	}
+
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		time.Sleep(400 * time.Millisecond) // keep the scan mid-flight
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	binDir := t.TempDir()
+	bin := filepath.Join(binDir, "ctfuzz")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/ctfuzz")
+	build.Dir = "../.."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build binary: %v\n%s", err, out)
+	}
+
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+
+	urls := ""
+	for i := 0; i < 4; i++ {
+		urls += fmt.Sprintf("%s/endpoint%d\n", server.URL, i)
+	}
+	if err := os.WriteFile(urlsPath, []byte(urls), 0600); err != nil {
+		t.Fatalf("write urls: %v", err)
+	}
+	if err := os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	proc := exec.Command(bin,
+		"--urls", urlsPath,
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--concurrency", "1",
+		"--timeout", "5s",
+		"--types", "application/json",
+		"--canary", "none",
+	)
+	proc.Stdout = io.Discard
+	proc.Stderr = io.Discard
+	if err := proc.Start(); err != nil {
+		t.Fatalf("start binary: %v", err)
+	}
+
+	// Wait until the scan is provably mid-flight (first request entered
+	// its 400ms handler sleep), then interrupt.
+	deadline := time.Now().Add(10 * time.Second)
+	for hits.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if hits.Load() == 0 {
+		_ = proc.Process.Kill()
+		t.Fatal("scan never started; no server hits")
+	}
+	if err := proc.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("send SIGINT: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- proc.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				t.Fatalf("binary died to the signal instead of shutting down gracefully: %v", exitErr)
+			}
+			t.Fatalf("wait: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		_ = proc.Process.Kill()
+		t.Fatal("binary did not exit within 15s of SIGINT")
+	}
+
+	if got := hits.Load(); got > 2 {
+		t.Fatalf("expected at most 2 server hits (1 completed, at most 1 in flight), got %d", got)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("partial results were not written: %v", err)
+	}
+	lines := []map[string]any{}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("decode jsonl: %v", err)
+		}
+		lines = append(lines, row)
+	}
+	if len(lines) < 2 {
+		t.Fatalf("expected manifest plus at least one request row, got %d lines", len(lines))
+	}
+	if lines[0]["kind"] != "manifest" {
+		t.Fatalf("first line must be the manifest, got %v", lines[0]["kind"])
+	}
+	if lines[0]["interrupted"] != true {
+		t.Fatal("manifest must record interrupted=true")
+	}
+	requestRows := 0
+	for _, row := range lines[1:] {
+		if row["kind"] != "summary" {
+			requestRows++
+		}
+	}
+	if requestRows == 0 || requestRows >= 4 {
+		t.Fatalf("expected a partial set of request rows (1..3), got %d", requestRows)
+	}
+}
+
+// TestInterruptDuringFinalRequestsStillFlagsManifest pins the tail window:
+// if cancellation lands after the producer has handed off its last job but
+// while requests are still in flight (the last --concurrency requests of
+// every scan), the run is still partial and the manifest must say so.
+func TestInterruptDuringFinalRequestsStillFlagsManifest(t *testing.T) {
+	var hits atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path == "/endpoint2" { // final planned request
+			cancel()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	urlsPath := filepath.Join(dir, "urls.txt")
+	payloadPath := filepath.Join(dir, "payload.json")
+	outPath := filepath.Join(dir, "out.jsonl")
+
+	urls := ""
+	for i := 0; i < 3; i++ {
+		urls += fmt.Sprintf("%s/endpoint%d\n", server.URL, i)
+	}
+	if err := os.WriteFile(urlsPath, []byte(urls), 0600); err != nil {
+		t.Fatalf("write urls: %v", err)
+	}
+	if err := os.WriteFile(payloadPath, []byte(`{"k":"v"}`), 0600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	if _, err := runCtx(ctx, []string{
+		"--urls", urlsPath,
+		"--payload", payloadPath,
+		"--out", outPath,
+		"--concurrency", "1",
+		"--timeout", "2s",
+		"--types", "application/json",
+		"--canary", "none",
+	}, func() {}); err != nil {
+		t.Fatalf("runCtx: %v", err)
+	}
+
+	if got := hits.Load(); got != 3 {
+		t.Fatalf("expected all 3 requests to start, got %d", got)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	var manifest struct {
+		Interrupted bool `json:"interrupted"`
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			t.Fatalf("decode jsonl: %v", err)
+		}
+		if raw["kind"] == "manifest" {
+			if err := json.Unmarshal([]byte(line), &manifest); err != nil {
+				t.Fatalf("decode manifest: %v", err)
+			}
+		}
+	}
+	if !manifest.Interrupted {
+		t.Fatal("cancellation during the final in-flight request must still flag the manifest as interrupted")
 	}
 }
 

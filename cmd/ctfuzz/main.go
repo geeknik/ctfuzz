@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"ctfuzz/internal/analyze"
@@ -69,7 +71,7 @@ func main() {
 	)
 	switch sub {
 	case "scan", "":
-		hasFindings, err = run(rest)
+		hasFindings, err = runSignalAware(rest)
 	case "replay":
 		err = runReplay(rest)
 	case "report":
@@ -145,7 +147,23 @@ Run 'ctfuzz scan -h', 'ctfuzz replay -h', or 'ctfuzz report -h' for per-subcomma
 `)
 }
 
+// runSignalAware runs a scan with SIGINT/SIGTERM wired for graceful
+// shutdown: the first signal cancels the run context so partial results
+// are still flushed to --out; stop is called as soon as the run notices
+// the cancellation, restoring default signal behavior so a second signal
+// force-quits during the flush.
+func runSignalAware(args []string) (bool, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runCtx(ctx, args, stop)
+}
+
+// run is the test entry point: an uncancelable scan.
 func run(args []string) (bool, error) {
+	return runCtx(context.Background(), args, func() {})
+}
+
+func runCtx(ctx context.Context, args []string, stop func()) (bool, error) {
 	cfg, err := config.Parse(args, os.Stderr)
 	if err != nil {
 		return false, err
@@ -229,7 +247,16 @@ func run(args []string) (bool, error) {
 		return false, err
 	}
 
-	results := execute(context.Background(), client, cfg, urls, headers, variants)
+	results, interrupted := execute(ctx, client, cfg, urls, headers, variants)
+	if interrupted {
+		fmt.Fprintf(os.Stderr, "[!] interrupted after %d of %d planned requests; writing partial results (a second Ctrl-C force-quits)\n",
+			len(results), plan.Requests)
+		// Restore default signal handling so a second interrupt kills the
+		// process instead of being swallowed during the flush.
+		if stop != nil {
+			stop()
+		}
+	}
 	summaries := summarize(urls, cfg.Methods, results)
 	summaryByKey := make(map[string]result.Summary, len(summaries))
 	hasFindings := false
@@ -258,13 +285,14 @@ func run(args []string) (bool, error) {
 	}
 
 	manifest := result.Manifest{
-		Kind:     "manifest",
-		Schema:   1,
-		Created:  time.Now().UTC().Format(time.RFC3339),
-		Canary:   cfg.Canary,
-		Methods:  cfg.Methods,
-		Types:    cfg.Types,
-		Mismatch: cfg.Mismatch,
+		Kind:        "manifest",
+		Schema:      1,
+		Created:     time.Now().UTC().Format(time.RFC3339),
+		Canary:      cfg.Canary,
+		Methods:     cfg.Methods,
+		Types:       cfg.Types,
+		Mismatch:    cfg.Mismatch,
+		Interrupted: interrupted,
 	}
 	if err := output.WriteJSONL(cfg.OutputFile, manifest, results, summaries); err != nil {
 		return false, err
@@ -321,7 +349,7 @@ func buildVariants(cfg config.Config, basePayload map[string]any) ([]variant, er
 	return out, nil
 }
 
-func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, urls []string, headers http.Header, variants []variant) []result.Request {
+func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, urls []string, headers http.Header, variants []variant) ([]result.Request, bool) {
 	jobs := make(chan job)
 	resultsCh := make(chan result.Request)
 
@@ -350,7 +378,10 @@ func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, 
 					fmt.Printf("[.] %s %s %s status=%d error=%q\n", item.method, item.url, item.variant, res.Status, res.Error)
 				}
 				if cfg.Delay > 0 {
-					time.Sleep(cfg.Delay)
+					select {
+					case <-ctx.Done():
+					case <-time.After(cfg.Delay):
+					}
 				}
 			}
 		}()
@@ -359,6 +390,9 @@ func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, 
 	hostCount := map[string]int{}
 	skipped := 0
 	go func() {
+		defer close(resultsCh)
+		defer wg.Wait()
+		defer close(jobs)
 		seq := 0
 		for _, targetURL := range urls {
 			host := hostKey(targetURL)
@@ -368,8 +402,10 @@ func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, 
 						skipped++
 						continue
 					}
-					hostCount[host]++
-					jobs <- job{
+					select {
+					case <-ctx.Done():
+						return
+					case jobs <- job{
 						seq:          seq,
 						url:          targetURL,
 						method:       method,
@@ -378,14 +414,13 @@ func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, 
 						omitCT:       v.OmitCT,
 						bodyEncoding: v.BodyEncoding,
 						body:         v.Body,
+					}:
+						hostCount[host]++
+						seq++
 					}
-					seq++
 				}
 			}
 		}
-		close(jobs)
-		wg.Wait()
-		close(resultsCh)
 	}()
 
 	results := make([]result.Request, 0, len(urls)*len(cfg.Methods)*len(variants))
@@ -398,7 +433,12 @@ func execute(ctx context.Context, client *httpclient.Client, cfg config.Config, 
 	if skipped > 0 {
 		fmt.Fprintf(os.Stderr, "[!] max-requests-per-host dropped %d jobs\n", skipped)
 	}
-	return results
+	// The producer only observes cancellation while it still has jobs to
+	// hand off; an interrupt during the final in-flight requests would
+	// otherwise go unflagged. After the results channel closes every
+	// worker is done, so the context is the single source of truth.
+	interrupted := ctx.Err() != nil
+	return results, interrupted
 }
 
 func printHeaderGroups(summary result.Summary, verbose bool) {

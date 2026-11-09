@@ -34,6 +34,10 @@ type Manifest struct {
 	Methods  []string `json:"methods"`
 	Types    []string `json:"types"`
 	Mismatch bool     `json:"mismatch,omitempty"`
+	// Interrupted is true when the scan was canceled by SIGINT/SIGTERM and
+	// the JSONL holds only the requests that actually ran. Downstream
+	// report tooling should treat the run as partial.
+	Interrupted bool `json:"interrupted,omitempty"`
 }
 
 type Summary struct {

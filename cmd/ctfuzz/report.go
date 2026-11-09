@@ -103,6 +103,9 @@ func writeMarkdownReport(manifest result.Manifest, summaries []result.Summary, r
 	if manifest.Mismatch {
 		fmt.Fprintln(w, "- mismatch: enabled")
 	}
+	if manifest.Interrupted {
+		fmt.Fprintln(w, "- interrupted: `true` (partial run — some planned requests never ran)")
+	}
 	if manifest.Canary != "" {
 		fmt.Fprintf(w, "- canary: `%s`\n", manifest.Canary)
 	}
