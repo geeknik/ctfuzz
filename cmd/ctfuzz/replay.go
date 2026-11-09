@@ -18,12 +18,12 @@ func runReplay(args []string) error {
 	fs := flag.NewFlagSet("ctfuzz replay", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
-		jsonlPath   string
-		payloadPath string
-		seq         int
-		urlFilter   string
-		methodOnly  string
-		variantOnly string
+		jsonlPath    string
+		payloadPath  string
+		seq          int
+		urlFilter    string
+		methodOnly   string
+		variantOnly  string
 		onlyFindings bool
 	)
 	fs.StringVar(&jsonlPath, "jsonl", "", "scan results JSONL (required)")
@@ -179,4 +179,3 @@ func loadJSONL(path string) (result.Manifest, []result.Request, []result.Summary
 	}
 	return manifest, requests, summaries, nil
 }
-

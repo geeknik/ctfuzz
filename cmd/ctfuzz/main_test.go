@@ -193,10 +193,10 @@ func TestMethodsMatrixSplitsSummariesByMethod(t *testing.T) {
 
 func TestMismatchAddsVariantsAndTagsBodyEncoding(t *testing.T) {
 	var seen struct {
-		mu         sync.Mutex
-		variants   map[string]int
-		bodies     map[string]string
-		noCTCount  int
+		mu        sync.Mutex
+		variants  map[string]int
+		bodies    map[string]string
+		noCTCount int
 	}
 	seen.variants = map[string]int{}
 	seen.bodies = map[string]string{}

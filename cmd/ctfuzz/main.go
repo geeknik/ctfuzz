@@ -34,7 +34,7 @@ type job struct {
 	url          string
 	method       string
 	variant      string
-	contentType string
+	contentType  string
 	omitCT       bool
 	bodyEncoding string
 	body         []byte
@@ -48,10 +48,10 @@ type job struct {
 //	3  scope violation (URLs outside --scope-file; --allow-scope-drops bypasses)
 //	4  clean run, interesting findings present
 const (
-	exitOK           = 0
-	exitError        = 1
-	exitScope        = 3
-	exitFindings     = 4
+	exitOK       = 0
+	exitError    = 1
+	exitScope    = 3
+	exitFindings = 4
 )
 
 func main() {
@@ -525,16 +525,16 @@ func hostKey(raw string) string {
 }
 
 type runPlan struct {
-	Hosts           []string
-	PerHost         map[string]int
-	URLs            int
-	Types           int
-	MismatchCount   int
-	VariantsPerURL  int
-	Methods         []string
-	Requests        int
-	DryRun          bool
-	CanaryTag       string
+	Hosts          []string
+	PerHost        map[string]int
+	URLs           int
+	Types          int
+	MismatchCount  int
+	VariantsPerURL int
+	Methods        []string
+	Requests       int
+	DryRun         bool
+	CanaryTag      string
 }
 
 func buildPlan(cfg config.Config, urls []string) runPlan {

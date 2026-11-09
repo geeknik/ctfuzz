@@ -1,8 +1,8 @@
 package httpclient
 
 import (
-	crand "crypto/rand"
 	"context"
+	crand "crypto/rand"
 	"encoding/binary"
 	"math"
 	"sync"
